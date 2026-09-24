@@ -1,0 +1,4 @@
+## esp-zigbee-sdk 2.x, downloaded automatically on first build.
+dependencies:
+  idf: ">=5.5.0"
+  espressif/esp-zigbee-lib: "^2.0.0"
