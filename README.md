@@ -214,11 +214,6 @@ Known limitation: encoder interrupts pause for a few milliseconds while
 the Zigbee stack writes to flash, which can very occasionally drop a
 single count.
 
-## License
-
-<!-- Pick one — MIT is a common default for a project like this.
-     https://choosealicense.com/ -->
-
 ## Contributing / issues
 
 Pull requests and issue reports welcome — this was built for one specific
