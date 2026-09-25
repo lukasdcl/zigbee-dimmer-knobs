@@ -23,7 +23,7 @@ runs on real hardware, bound to real bulb(s), but it hasn't seen extended
 field use, isn't UL/CE tested, and the code has some rough edges noted below
 under "Checked vs not checked".
 
-I intend to add the ability for two knobs in future. 
+I am developing **multi-knob** support, currently un-tested in the multi-knob branch of this repo.
 
 ## Hardware you need
 
