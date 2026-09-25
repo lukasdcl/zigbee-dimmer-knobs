@@ -1,14 +1,14 @@
 /*
- * zb_knob.c - Zigbee rotary dimmer knob (esp-zigbee-sdk 2.x).
+ * zb_knob.c - Zigbee rotary dimmer knobs (esp-zigbee-sdk 2.x).
  *
  * Written against Espressif's published SDK 2.x API reference. Every Zigbee
  * call below runs inside the Zigbee task: either in a stack callback, or in a
  * function posted to the Zigbee task queue. That is the SDK's rule for calling
  * the stack without taking its lock, so no locks are needed anywhere.
  *
- * How it works:
+ * How it works (the same for every knob, each completely on its own):
  *
- *   The knob keeps its own INTENT - a brightness number and on/off - and every
+ *   A knob keeps its own INTENT - a brightness number and on/off - and every
  *   command is derived from that. While you turn, it sends relative Step
  *   commands, which are fast and feel immediate. When you stop, it sends one
  *   absolute "go to this level", which is self-correcting: any bulb that
@@ -21,12 +21,29 @@
  *   Turning up from off comes on at minimum. The button restores the bulb's
  *   own previous brightness.
  *
- *   If you bind bulbs back to endpoint 2 in Z2M, their reports update the
- *   model so changes made in Home Assistant are picked up. Nothing depends on
- *   that: without it the knob simply trusts its own intent.
+ *   If you bind bulbs back to a knob's report endpoint in Z2M, their reports
+ *   update THAT knob's model so changes made in Home Assistant are picked up.
+ *   Nothing depends on that: without it the knob simply trusts its own intent.
+ *
+ * How several knobs are kept apart:
+ *
+ *   Everything one knob knows lives in one knob_t (below), and there is an
+ *   array of them - one per row of KNOB_WIRING. Every function that does
+ *   knob work takes a `knob_t *k` - "which knob am I working on" - and only
+ *   ever reads or writes k->something. Where the SDK or a timer calls us
+ *   back, we hand it that same pointer as its "context" when we set it up,
+ *   so it arrives back already knowing which knob it belongs to. There is no
+ *   "current knob" variable anywhere, which is what makes crossover between
+ *   knobs impossible by construction rather than by care.
+ *
+ *   What is deliberately SHARED: the radio, the network join/rejoin logic,
+ *   flash set-up, and the single 10 ms poll timer. The poll timer holds no
+ *   state of its own; it just visits each knob in turn, the same way one
+ *   person can check four clocks.
  */
 #include "zb_knob.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
 
@@ -46,6 +63,83 @@
 
 static const char *TAG = "knob";
 
+#define LEVEL_MIN 1
+#define LEVEL_MAX 254
+
+/* Reports coming back from bulbs: up to this many collected per window. */
+#define REPORT_SLOTS 8
+
+/* ------------------------------------------------------------------ */
+/* One knob's complete state                                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int      idx;                 /* 0-based position in KNOB_WIRING       */
+    uint8_t  cmd_ep;              /* endpoint commands go out from         */
+    uint8_t  report_ep;           /* endpoint reports arrive on (0 = none) */
+
+    knob_tuning_t tune;           /* this knob's live settings             */
+
+    /* The model: what this knob believes its lights should be doing.
+     * Every command is derived from this, so all bound bulbs converge on
+     * the same numbers whatever they individually missed. */
+    uint8_t  level;               /* intended brightness, 1..254       */
+    bool     on;                  /* intended on/off                   */
+    bool     known;               /* true once a bulb has confirmed it */
+    volatile bool     on_pending; /* waiting for a bulb to confirm on  */
+    volatile uint32_t on_since_us;
+    volatile uint8_t  wake_stage; /* stubborn-bulb wake sequence       */
+    esp_timer_handle_t wake_timer;
+
+    /* Encoder bookkeeping */
+    volatile bool     eval_posted;
+    volatile int32_t  consumed;
+    volatile int32_t  carry;
+    int8_t            dir;
+    int32_t           rev_accum;
+    uint32_t          last_accept_us;
+    volatile uint32_t last_send_us;
+    volatile uint32_t last_count_us;
+    volatile bool     settle_pending;
+
+    /* Link quality: used to back off when the radio is struggling */
+    volatile uint32_t tx_count, cnf_count, cnf_fail, tx_err;
+    volatile uint16_t recent_tx, recent_fail;
+    volatile uint16_t extra_tick_ms;
+    uint32_t          last_backoff_us;
+    uint32_t          last_warn_us;
+
+    /* Reports coming back from bulbs bound to report_ep (optional) */
+    volatile uint8_t  rep_level[REPORT_SLOTS];
+    volatile uint8_t  rep_level_n;
+    volatile uint8_t  rep_on_yes, rep_on_no;
+    volatile uint32_t rep_window_us;
+    volatile bool     rep_window_open;
+    volatile uint32_t reports_seen;
+} knob_t;
+
+static knob_t s_knobs[KNOB_COUNT];
+
+/* Shared by all knobs: one radio, one network. */
+static volatile bool      s_stack_ready;
+static esp_timer_handle_t s_poll_timer;
+static esp_timer_handle_t s_retry_timer;
+static volatile uint8_t   s_retry_mode;
+
+static inline uint32_t now_us(void) { return (uint32_t)esp_timer_get_time(); }
+
+static uint16_t effective_tick_ms(const knob_t *k)
+{
+    return (uint16_t)(k->tune.tick_ms + k->extra_tick_ms);
+}
+
+static uint8_t clamp_level(int32_t v)
+{
+    if (v < LEVEL_MIN) return LEVEL_MIN;
+    if (v > LEVEL_MAX) return LEVEL_MAX;
+    return (uint8_t)v;
+}
+
 /* ------------------------------------------------------------------ */
 /* Settings                                                            */
 /* ------------------------------------------------------------------ */
@@ -63,26 +157,16 @@ static const knob_tuning_t k_factory_tune = {
     .settle         = true,
 };
 
-knob_tuning_t g_knob_tune = {
-    .tick_ms        = KNOB_DEFAULT_TICK_MS,
-    .units          = KNOB_DEFAULT_UNITS,
-    .fade_ds        = KNOB_DEFAULT_FADE_DS,
-    .settle_fade_ds = KNOB_DEFAULT_SETTLE_FADE_DS,
-    .settle_ms      = KNOB_DEFAULT_SETTLE_MS,
-    .floor_level    = KNOB_DEFAULT_FLOOR,
-    .debounce_ms    = KNOB_DEFAULT_DEBOUNCE_MS,
-    .log_tx         = (KNOB_DEFAULT_LOG_TX != 0),
-    .rev_counts     = KNOB_DEFAULT_REV_COUNTS,
-    .settle         = true,
-};
+knob_tuning_t *zb_knob_tuning(int knob) { return &s_knobs[knob].tune; }
 
 /* ------------------------------------------------------------------ */
-/* Settings saved in flash, so tuning survives reboots and reflashes   */
+/* Settings saved in flash, so tuning survives reboots and reflashes.  */
+/* Each knob has its own entry: "tune1", "tune2", ...                  */
 /* ------------------------------------------------------------------ */
 
-#define SETTINGS_NAMESPACE "knob"
-#define SETTINGS_KEY       "tune"
-#define SETTINGS_VERSION   1
+#define SETTINGS_NAMESPACE   "knob"
+#define SETTINGS_LEGACY_KEY  "tune"    /* what the single-knob build used */
+#define SETTINGS_VERSION     1
 
 typedef struct {
     uint8_t       version;
@@ -90,8 +174,20 @@ typedef struct {
     knob_tuning_t tune;
 } knob_saved_t;
 
-void zb_knob_save_settings(void)
+/* Fills `key` with this knob's flash key: "tune1" for the first knob etc.
+ * (Flash keys can be at most 15 characters; this is always short.) */
+#define SETTINGS_KEY_LEN 16
+static void settings_key(const knob_t *k, char key[SETTINGS_KEY_LEN])
 {
+    snprintf(key, SETTINGS_KEY_LEN, "tune%d", k->idx + 1);
+}
+
+void zb_knob_save_settings(int knob)
+{
+    const knob_t *k = &s_knobs[knob];
+    char key[SETTINGS_KEY_LEN];
+    settings_key(k, key);
+
     nvs_handle_t h;
     esp_err_t err = nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) {
@@ -100,201 +196,170 @@ void zb_knob_save_settings(void)
     }
     knob_saved_t saved = {
         .version = SETTINGS_VERSION,
-        .reverse = input_get_reverse(),
-        .tune    = g_knob_tune,
+        .reverse = input_get_reverse(knob),
+        .tune    = k->tune,
     };
-    err = nvs_set_blob(h, SETTINGS_KEY, &saved, sizeof(saved));
+    err = nvs_set_blob(h, key, &saved, sizeof(saved));
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
     nvs_close(h);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "settings not saved: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "knob %d: settings not saved: %s", knob + 1, esp_err_to_name(err));
     }
 }
 
-void zb_knob_forget_settings(void)
+void zb_knob_forget_settings(int knob)
 {
+    knob_t *k = &s_knobs[knob];
+    char key[SETTINGS_KEY_LEN];
+    settings_key(k, key);
+
     nvs_handle_t h;
     if (nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_key(h, SETTINGS_KEY);
+        nvs_erase_key(h, key);
+        if (knob == 0) {
+            nvs_erase_key(h, SETTINGS_LEGACY_KEY);   /* so it isn't picked up again */
+        }
         nvs_commit(h);
         nvs_close(h);
     }
-    g_knob_tune = k_factory_tune;
-    input_set_reverse(KNOB_ENCODER_REVERSE_DEFAULT != 0);
-    ESP_LOGI(TAG, "settings back to the built-in defaults");
+    k->tune = k_factory_tune;
+    input_set_reverse(knob, KNOB_ENCODER_REVERSE_DEFAULT != 0);
+    ESP_LOGI(TAG, "knob %d: settings back to the built-in defaults", knob + 1);
 }
 
-static void load_settings(void)
+static bool read_saved(nvs_handle_t h, const char *key, knob_saved_t *out)
+{
+    size_t len = sizeof(*out);
+    esp_err_t err = nvs_get_blob(h, key, out, &len);
+    /* Ignore anything saved by an older build with a different layout. */
+    return err == ESP_OK && len == sizeof(*out) && out->version == SETTINGS_VERSION;
+}
+
+static void load_settings(knob_t *k)
 {
     nvs_handle_t h;
     if (nvs_open(SETTINGS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
         return;                    /* nothing saved yet: keep the defaults */
     }
+    char key[SETTINGS_KEY_LEN];
+    settings_key(k, key);
     knob_saved_t saved;
-    size_t len = sizeof(saved);
-    esp_err_t err = nvs_get_blob(h, SETTINGS_KEY, &saved, &len);
+    bool found = read_saved(h, key, &saved);
+
+    /* Knob 1 falls back to what the single-knob firmware saved, so
+     * upgrading doesn't lose tuning you'd already done. */
+    if (!found && k->idx == 0) {
+        found = read_saved(h, SETTINGS_LEGACY_KEY, &saved);
+    }
     nvs_close(h);
 
-    /* Ignore anything saved by an older build with a different layout. */
-    if (err == ESP_OK && len == sizeof(saved) && saved.version == SETTINGS_VERSION) {
-        g_knob_tune = saved.tune;
-        input_set_reverse(saved.reverse);
-        ESP_LOGI(TAG, "settings restored from flash");
+    if (found) {
+        k->tune = saved.tune;
+        input_set_reverse(k->idx, saved.reverse);
+        ESP_LOGI(TAG, "knob %d: settings restored from flash", k->idx + 1);
     }
-}
-
-#define LEVEL_MIN 1
-#define LEVEL_MAX 254
-
-/* ------------------------------------------------------------------ */
-/* The model: what the knob believes the lights should be doing.       */
-/* Every command is derived from this, so all bound bulbs converge on  */
-/* the same numbers whatever they individually missed.                 */
-/* ------------------------------------------------------------------ */
-
-static volatile bool     s_on_pending;      /* waiting for a bulb to confirm on  */
-static volatile uint32_t s_on_since_us;
-static volatile uint8_t  s_wake_stage;      /* stubborn-bulb wake sequence      */
-static esp_timer_handle_t s_wake_timer;
-
-static uint8_t  s_level = 128;       /* intended brightness, 1..254       */
-static bool     s_on    = true;      /* intended on/off                   */
-static bool     s_known;             /* true once a bulb has confirmed it */
-
-/* Encoder bookkeeping */
-static volatile bool     s_stack_ready;
-static volatile bool     s_eval_posted;
-static volatile int32_t  s_consumed;
-static volatile int32_t  s_carry;
-static int8_t            s_dir;
-static int32_t           s_rev_accum;
-static uint32_t          s_last_accept_us;
-static volatile uint32_t s_last_send_us;
-static volatile uint32_t s_last_count_us;
-static volatile bool     s_settle_pending;
-
-/* Link quality: used to back off when the radio is struggling */
-static volatile uint32_t s_tx_count, s_cnf_count, s_cnf_fail, s_tx_err;
-static volatile uint16_t s_recent_tx, s_recent_fail;
-static volatile uint16_t s_extra_tick_ms;
-static uint32_t          s_last_backoff_us;
-static uint32_t          s_last_warn_us;
-
-/* Reports coming back from bulbs on endpoint 2 (optional) */
-#define REPORT_SLOTS 8
-static volatile uint8_t  s_rep_level[REPORT_SLOTS];
-static volatile uint8_t  s_rep_level_n;
-static volatile uint8_t  s_rep_on_yes, s_rep_on_no;
-static volatile uint32_t s_rep_window_us;
-static volatile bool     s_rep_window_open;
-static volatile uint32_t s_reports_seen;
-
-static esp_timer_handle_t s_poll_timer;
-static esp_timer_handle_t s_retry_timer;
-static volatile uint8_t   s_retry_mode;
-
-static inline uint32_t now_us(void) { return (uint32_t)esp_timer_get_time(); }
-
-static uint16_t effective_tick_ms(void)
-{
-    return (uint16_t)(g_knob_tune.tick_ms + s_extra_tick_ms);
-}
-
-static uint8_t clamp_level(int32_t v)
-{
-    if (v < LEVEL_MIN) return LEVEL_MIN;
-    if (v > LEVEL_MAX) return LEVEL_MAX;
-    return (uint8_t)v;
 }
 
 /* ------------------------------------------------------------------ */
 /* Sending. Everything goes to the binding table - no addresses here.  */
 /* ------------------------------------------------------------------ */
 
+/* Called by the stack when a send completes. `user_ctx` is the knob that
+ * sent it (set in fill_ctrl), so each knob only counts its own sends. */
 static void tx_confirm_cb(ezb_af_user_cnf_t *cnf, void *user_ctx)
 {
-    s_cnf_count++;
-    if (s_recent_tx < 1000) {
-        s_recent_tx++;
+    knob_t *k = (knob_t *)user_ctx;
+    if (k == NULL) {
+        return;
+    }
+    k->cnf_count++;
+    if (k->recent_tx < 1000) {
+        k->recent_tx++;
     }
     if (cnf != NULL && cnf->status != 0) {
-        s_cnf_fail++;
-        if (s_recent_fail < 1000) {
-            s_recent_fail++;
+        k->cnf_fail++;
+        if (k->recent_fail < 1000) {
+            k->recent_fail++;
         }
     }
 }
 
-static void fill_ctrl(ezb_zcl_cluster_cmd_ctrl_t *ctrl)
+/* Commands go out from THIS knob's endpoint, so the stack uses the bindings
+ * made for that endpoint - i.e. this knob's bulbs and nobody else's. */
+static void fill_ctrl(knob_t *k, ezb_zcl_cluster_cmd_ctrl_t *ctrl)
 {
     memset(ctrl, 0, sizeof(*ctrl));
     ctrl->dst_addr.addr_mode = EZB_ADDR_MODE_NONE;   /* = use the bindings */
-    ctrl->src_ep             = KNOB_EP;
+    ctrl->src_ep             = k->cmd_ep;
     ctrl->dis_default_rsp    = true;
     ctrl->cnf_ctx.cb         = tx_confirm_cb;
-    ctrl->cnf_ctx.user_ctx   = NULL;
+    ctrl->cnf_ctx.user_ctx   = k;
 }
 
-static void note_tx(const char *what, ezb_err_t err)
+static void note_tx(knob_t *k, const char *what, ezb_err_t err)
 {
     if (err == EZB_ERR_NONE) {
-        s_tx_count++;
-        s_last_send_us = now_us();
+        k->tx_count++;
+        k->last_send_us = now_us();
         return;
     }
-    s_tx_err++;
+    k->tx_err++;
     uint32_t now = now_us();
-    if (now - s_last_warn_us > 2000000u) {
-        s_last_warn_us = now;
-        ESP_LOGW(TAG, "%s not sent (error %d) - is the knob bound to a bulb?", what, (int)err);
+    if (now - k->last_warn_us > 2000000u) {
+        k->last_warn_us = now;
+        ESP_LOGW(TAG, "knob %d: %s not sent (error %d) - is endpoint %u bound to a bulb?",
+                 k->idx + 1, what, (int)err, k->cmd_ep);
     }
 }
 
-static void send_onoff(bool on)
+static void send_onoff(knob_t *k, bool on)
 {
     ezb_zcl_on_off_cmd_t cmd;
-    fill_ctrl(&cmd.cmd_ctrl);
+    fill_ctrl(k, &cmd.cmd_ctrl);
     ezb_err_t err = on ? ezb_zcl_on_off_on_cmd_req(&cmd) : ezb_zcl_on_off_off_cmd_req(&cmd);
-    note_tx(on ? "On" : "Off", err);
-    if (err == EZB_ERR_NONE && g_knob_tune.log_tx) {
-        ESP_LOGI(TAG, "TX %s", on ? "ON" : "OFF");
+    note_tx(k, on ? "On" : "Off", err);
+    if (err == EZB_ERR_NONE && k->tune.log_tx) {
+        ESP_LOGI(TAG, "knob %d: TX %s", k->idx + 1, on ? "ON" : "OFF");
     }
 }
 
 /* Relative. Plain Step, NOT the with-on/off variant: dimming must never
  * switch a bulb off, or bulbs drop out one at a time near the bottom. */
-static bool send_step(bool up, uint8_t size)
+static bool send_step(knob_t *k, bool up, uint8_t size)
 {
     ezb_zcl_level_step_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
-    fill_ctrl(&cmd.cmd_ctrl);
+    fill_ctrl(k, &cmd.cmd_ctrl);
     cmd.payload.step_mode       = up ? 0 : 1;
     cmd.payload.step_size       = size;
-    cmd.payload.transition_time = g_knob_tune.fade_ds;
+    cmd.payload.transition_time = k->tune.fade_ds;
     ezb_err_t err = ezb_zcl_level_step_cmd_req(&cmd);
-    note_tx("Step", err);
-    if (err == EZB_ERR_NONE && g_knob_tune.log_tx) {
-        ESP_LOGI(TAG, "TX step %-4s %3u  -> model %3u", up ? "up" : "down", size, s_level);
+    note_tx(k, "Step", err);
+    if (err == EZB_ERR_NONE && k->tune.log_tx) {
+        ESP_LOGI(TAG, "knob %d: TX step %-4s %3u  -> model %3u",
+                 k->idx + 1, up ? "up" : "down", size, k->level);
     }
     return err == EZB_ERR_NONE;
 }
 
 /* Absolute, and therefore self-correcting: sending it twice changes nothing,
  * so any bulb that missed steps is pulled back into line. */
-static bool send_level(uint8_t level, bool with_on_off, uint8_t fade_ds, const char *why)
+static bool send_level(knob_t *k, uint8_t level, bool with_on_off, uint8_t fade_ds,
+                       const char *why)
 {
     ezb_zcl_level_move_to_level_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
-    fill_ctrl(&cmd.cmd_ctrl);
+    fill_ctrl(k, &cmd.cmd_ctrl);
     cmd.payload.level           = level;
     cmd.payload.transition_time = fade_ds;
     ezb_err_t err = with_on_off ? ezb_zcl_level_move_to_level_with_on_off_cmd_req(&cmd)
                                 : ezb_zcl_level_move_to_level_cmd_req(&cmd);
-    note_tx("Level", err);
-    if (err == EZB_ERR_NONE && g_knob_tune.log_tx) {
-        ESP_LOGI(TAG, "TX level %3u %s(%s)", level, with_on_off ? "+on " : "", why);
+    note_tx(k, "Level", err);
+    if (err == EZB_ERR_NONE && k->tune.log_tx) {
+        ESP_LOGI(TAG, "knob %d: TX level %3u %s(%s)",
+                 k->idx + 1, level, with_on_off ? "+on " : "", why);
     }
     return err == EZB_ERR_NONE;
 }
@@ -303,30 +368,30 @@ static bool send_level(uint8_t level, bool with_on_off, uint8_t fade_ds, const c
 /* Direction lock (contact chatter / the knob settling into a detent)  */
 /* ------------------------------------------------------------------ */
 
-static void filter_counts(int32_t raw, uint32_t now)
+static void filter_counts(knob_t *k, int32_t raw, uint32_t now)
 {
-    if (s_dir != 0 && s_carry == 0 && (now - s_last_accept_us) > 500000u) {
-        s_dir = 0;
-        s_rev_accum = 0;
+    if (k->dir != 0 && k->carry == 0 && (now - k->last_accept_us) > 500000u) {
+        k->dir = 0;
+        k->rev_accum = 0;
     }
     if (raw == 0) {
         return;
     }
     int8_t rdir = raw > 0 ? 1 : -1;
-    if (s_dir == 0 || rdir == s_dir || g_knob_tune.rev_counts == 0) {
-        s_dir = rdir;
-        s_carry += raw;
-        s_rev_accum = 0;
-        s_last_accept_us = now;
+    if (k->dir == 0 || rdir == k->dir || k->tune.rev_counts == 0) {
+        k->dir = rdir;
+        k->carry += raw;
+        k->rev_accum = 0;
+        k->last_accept_us = now;
         return;
     }
-    s_rev_accum += raw;
-    int32_t mag = s_rev_accum < 0 ? -s_rev_accum : s_rev_accum;
-    if (mag >= g_knob_tune.rev_counts) {
-        s_dir = rdir;
-        s_carry += s_rev_accum;
-        s_rev_accum = 0;
-        s_last_accept_us = now;
+    k->rev_accum += raw;
+    int32_t mag = k->rev_accum < 0 ? -k->rev_accum : k->rev_accum;
+    if (mag >= k->tune.rev_counts) {
+        k->dir = rdir;
+        k->carry += k->rev_accum;
+        k->rev_accum = 0;
+        k->last_accept_us = now;
     }
 }
 
@@ -340,136 +405,140 @@ static void filter_counts(int32_t raw, uint32_t now)
  * 200 ms apart: the combined command (which is all IKEA bulbs need), then a
  * plain On, then a plain "go to minimum" to undo the brightness that On
  * restores. Bulbs already at minimum see no change from the later two.
+ * Each knob has its own wake timer, so two knobs can wake at once.
  */
 static void wake_stage_in_zb(void *ctx)
 {
-    if (s_wake_stage == 1) {
-        send_onoff(true);
-    } else if (s_wake_stage == 2) {
-        send_level(LEVEL_MIN, false, 0, "wake to min");
+    knob_t *k = (knob_t *)ctx;
+    if (k->wake_stage == 1) {
+        send_onoff(k, true);
+    } else if (k->wake_stage == 2) {
+        send_level(k, LEVEL_MIN, false, 0, "wake to min");
     }
-    if (s_wake_stage < 2) {
-        s_wake_stage++;
-        esp_timer_start_once(s_wake_timer, 200000u);
+    if (k->wake_stage < 2) {
+        k->wake_stage++;
+        esp_timer_start_once(k->wake_timer, 200000u);
     }
 }
 
 static void wake_timer_cb(void *arg)
 {
-    esp_zigbee_task_queue_post(wake_stage_in_zb, NULL);
+    esp_zigbee_task_queue_post(wake_stage_in_zb, arg);   /* arg = this knob */
 }
 
-static void start_wake_sequence(uint32_t now)
+static void start_wake_sequence(knob_t *k, uint32_t now)
 {
-    s_level        = LEVEL_MIN;
-    s_on           = true;
-    s_on_pending   = true;       /* until a bulb reports back that it's on */
-    s_on_since_us  = now;
-    s_settle_pending = false;
-    send_level(LEVEL_MIN, true, 0, "on from off");
-    s_wake_stage = 1;
-    esp_timer_stop(s_wake_timer);
-    esp_timer_start_once(s_wake_timer, 200000u);
+    k->level          = LEVEL_MIN;
+    k->on             = true;
+    k->on_pending     = true;       /* until a bulb reports back that it's on */
+    k->on_since_us    = now;
+    k->settle_pending = false;
+    send_level(k, LEVEL_MIN, true, 0, "on from off");
+    k->wake_stage = 1;
+    esp_timer_stop(k->wake_timer);
+    esp_timer_start_once(k->wake_timer, 200000u);
 }
 
-static void apply_turn(int32_t delta, uint32_t now)
+static void apply_turn(knob_t *k, int32_t delta, uint32_t now)
 {
-    s_carry = 0;
-    s_last_count_us = now;
+    k->carry = 0;
+    k->last_count_us = now;
 
     /* Off, and turned up: come on at minimum. Turning up from off feels like
      * it should light faintly, not jump back to whatever it was before - that
      * is what the button is for. */
-    if (!s_on || s_on_pending) {
+    if (!k->on || k->on_pending) {
         if (delta > 0) {
-            start_wake_sequence(now);
+            start_wake_sequence(k, now);
         }
         return;   /* turning down while off does nothing at all */
     }
 
-    int32_t target = (int32_t)s_level + delta * (int32_t)g_knob_tune.units;
+    int32_t target = (int32_t)k->level + delta * (int32_t)k->tune.units;
     uint8_t want = clamp_level(target);
 
-    if (want == s_level) {
+    if (want == k->level) {
         return;   /* already against the top or bottom: send nothing */
     }
 
     /* Near the bottom, land exactly on minimum in one absolute command, so
      * every bulb ends up on the same value instead of straggling down. */
-    if (want <= g_knob_tune.floor_level && target < (int32_t)s_level) {
-        s_level = LEVEL_MIN;
-        send_level(LEVEL_MIN, false, g_knob_tune.fade_ds, "floor");
-        s_settle_pending = true;
+    if (want <= k->tune.floor_level && target < (int32_t)k->level) {
+        k->level = LEVEL_MIN;
+        send_level(k, LEVEL_MIN, false, k->tune.fade_ds, "floor");
+        k->settle_pending = true;
         return;
     }
 
-    int32_t change = (int32_t)want - (int32_t)s_level;
-    uint8_t before = s_level;
-    s_level = want;
-    if (!send_step(change > 0, (uint8_t)(change > 0 ? change : -change))) {
-        s_level = before;   /* never left the radio: don't let the model drift */
+    int32_t change = (int32_t)want - (int32_t)k->level;
+    uint8_t before = k->level;
+    k->level = want;
+    if (!send_step(k, change > 0, (uint8_t)(change > 0 ? change : -change))) {
+        k->level = before;   /* never left the radio: don't let the model drift */
         return;
     }
-    s_settle_pending = true;
+    k->settle_pending = true;
 }
 
 /* The landing command, once your hand has stopped. */
-static void settle_in_zb(void *ctx)
+static void settle(knob_t *k)
 {
-    s_settle_pending = false;
-    if (!g_knob_tune.settle || !s_on) {
+    k->settle_pending = false;
+    if (!k->tune.settle || !k->on) {
         return;
     }
-    send_level(s_level, false, g_knob_tune.settle_fade_ds, "settle");
+    send_level(k, k->level, false, k->tune.settle_fade_ds, "settle");
 }
 
 static void engine_eval_in_zb(void *ctx)
 {
-    s_eval_posted = false;
+    knob_t *k = (knob_t *)ctx;
+    k->eval_posted = false;
 
     const uint32_t now   = now_us();
-    const int32_t  total = input_total();
-    const int32_t  raw   = total - s_consumed;
-    s_consumed = total;
+    const int32_t  total = input_total(k->idx);
+    const int32_t  raw   = total - k->consumed;
+    k->consumed = total;
 
     if (!ezb_bdb_dev_joined()) {
-        s_carry = 0;
+        k->carry = 0;
         return;
     }
 
-    filter_counts(raw, now);
-    if (s_carry != 0) {
+    filter_counts(k, raw, now);
+    if (k->carry != 0) {
         /* Counts only go out on the tick. The landing timer must never be
          * allowed to push a turn out early. */
-        if ((now - s_last_send_us) >= (uint32_t)effective_tick_ms() * 1000u) {
-            apply_turn(s_carry, now);
+        if ((now - k->last_send_us) >= (uint32_t)effective_tick_ms(k) * 1000u) {
+            apply_turn(k, k->carry, now);
         }
         return;
     }
 
-    if (s_settle_pending &&
-        (now - s_last_count_us) >= (uint32_t)g_knob_tune.settle_ms * 1000u &&
-        (now - s_last_send_us)  >= (uint32_t)g_knob_tune.settle_ms * 1000u) {
-        settle_in_zb(NULL);
+    if (k->settle_pending &&
+        (now - k->last_count_us) >= (uint32_t)k->tune.settle_ms * 1000u &&
+        (now - k->last_send_us)  >= (uint32_t)k->tune.settle_ms * 1000u) {
+        settle(k);
     }
 }
 
 static void button_press_in_zb(void *ctx)
 {
+    knob_t *k = (knob_t *)ctx;
     if (!ezb_bdb_dev_joined()) {
-        ESP_LOGW(TAG, "button pressed but not on a network yet");
+        ESP_LOGW(TAG, "knob %d: button pressed but not on a network yet", k->idx + 1);
         return;
     }
     /* Never Toggle: with several bulbs, one missed toggle leaves them
      * permanently opposite. An explicit On or Off can only ever converge. */
-    s_on = !s_on;
-    s_on_pending = false;
-    send_onoff(s_on);
-    s_settle_pending = false;
+    k->on = !k->on;
+    k->on_pending = false;
+    send_onoff(k, k->on);
+    k->settle_pending = false;
 }
 
 /* ------------------------------------------------------------------ */
-/* Reports from bulbs (optional, endpoint 2)                           */
+/* Reports from bulbs (optional, each knob's report endpoint)          */
 /* ------------------------------------------------------------------ */
 
 static uint8_t median_of(volatile uint8_t *v, uint8_t n)
@@ -486,79 +555,102 @@ static uint8_t median_of(volatile uint8_t *v, uint8_t n)
     return tmp[n / 2];
 }
 
-/* Only believe the bulbs when the knob has been still: during a turn they are
- * only echoing what we just sent, and mid-fade values would drag the model. */
-static bool reports_welcome(uint32_t now)
+#if KNOB_USE_REPORTS
+/* Only believe the bulbs when THIS knob has been still: during a turn they
+ * are only echoing what we just sent, and mid-fade values would drag the
+ * model. Another knob turning doesn't matter - its bulbs report to its own
+ * endpoint. */
+static bool reports_welcome(const knob_t *k, uint32_t now)
 {
-    return (now - s_last_send_us) > 1500000u && (now - s_last_count_us) > 1500000u;
+    return (now - k->last_send_us) > 1500000u && (now - k->last_count_us) > 1500000u;
 }
 
-static void note_report_level(uint8_t level, uint32_t now)
+static void open_report_window(knob_t *k, uint32_t now)
 {
-    if (!reports_welcome(now)) {
-        return;
+    if (!k->rep_window_open) {
+        k->rep_window_open = true;
+        k->rep_window_us = now;
+        k->rep_level_n = 0;
+        k->rep_on_yes = 0;
+        k->rep_on_no = 0;
     }
-    if (!s_rep_window_open) {
-        s_rep_window_open = true;
-        s_rep_window_us = now;
-        s_rep_level_n = 0;
-        s_rep_on_yes = 0;
-        s_rep_on_no = 0;
-    }
-    if (s_rep_level_n < REPORT_SLOTS) {
-        s_rep_level[s_rep_level_n++] = level;
-    }
-    s_reports_seen++;
 }
 
-static void note_report_onoff(bool on, uint32_t now)
+static void note_report_level(knob_t *k, uint8_t level, uint32_t now)
 {
-    s_reports_seen++;
-    if (s_on_pending) {          /* a bulb answering settles the question */
-        s_on_pending = false;
-        s_on = on;
-        s_known = true;
+    if (!reports_welcome(k, now)) {
         return;
     }
-    if (!reports_welcome(now)) {
+    open_report_window(k, now);
+    if (k->rep_level_n < REPORT_SLOTS) {
+        k->rep_level[k->rep_level_n++] = level;
+    }
+    k->reports_seen++;
+}
+
+static void note_report_onoff(knob_t *k, bool on, uint32_t now)
+{
+    k->reports_seen++;
+    if (k->on_pending) {          /* a bulb answering settles the question */
+        k->on_pending = false;
+        k->on = on;
+        k->known = true;
         return;
     }
-    if (!s_rep_window_open) {
-        s_rep_window_open = true;
-        s_rep_window_us = now;
-        s_rep_level_n = 0;
-        s_rep_on_yes = 0;
-        s_rep_on_no = 0;
+    if (!reports_welcome(k, now)) {
+        return;
     }
+    open_report_window(k, now);
     if (on) {
-        s_rep_on_yes++;
+        k->rep_on_yes++;
     } else {
-        s_rep_on_no++;
+        k->rep_on_no++;
     }
 }
+
+#endif /* KNOB_USE_REPORTS */
 
 /* Close the collection window: take the majority view, not an average, so a
  * single stray bulb can't drag the model. */
 static void close_report_window_in_zb(void *ctx)
 {
-    s_rep_window_open = false;
-    if (s_rep_level_n > 0) {
-        uint8_t m = median_of(s_rep_level, s_rep_level_n);
+    knob_t *k = (knob_t *)ctx;
+    if (!k->rep_window_open) {
+        return;     /* already closed by an earlier post */
+    }
+    k->rep_window_open = false;
+    if (k->rep_level_n > 0) {
+        uint8_t m = median_of(k->rep_level, k->rep_level_n);
         if (m >= LEVEL_MIN) {
-            s_level = m;
-            s_known = true;
+            k->level = m;
+            k->known = true;
         }
     }
-    if (s_rep_on_yes != s_rep_on_no) {
-        s_on = s_rep_on_yes > s_rep_on_no;
-        s_known = true;
+    if (k->rep_on_yes != k->rep_on_no) {
+        k->on = k->rep_on_yes > k->rep_on_no;
+        k->known = true;
     }
-    if (g_knob_tune.log_tx) {
-        ESP_LOGI(TAG, "model updated from bulbs: level %u, %s", s_level, s_on ? "on" : "off");
+    if (k->tune.log_tx) {
+        ESP_LOGI(TAG, "knob %d: model updated from bulbs: level %u, %s",
+                 k->idx + 1, k->level, k->on ? "on" : "off");
     }
 }
 
 #if KNOB_USE_REPORTS
+/* Which knob owns this endpoint? Reports bound to either of a knob's
+ * endpoints count for that knob (the single-knob firmware accepted them on
+ * both, so this keeps existing bindings working). NULL = no knob. */
+static knob_t *knob_for_endpoint(uint8_t ep)
+{
+    for (int i = 0; i < KNOB_COUNT; i++) {
+        knob_t *k = &s_knobs[i];
+        if (ep == k->cmd_ep || (k->report_ep != 0 && ep == k->report_ep)) {
+            return k;
+        }
+    }
+    return NULL;
+}
+
 static void handle_report(void *message)
 {
     if (message == NULL) {
@@ -568,14 +660,20 @@ static void handle_report(void *message)
     ezb_zcl_cmd_report_attr_message_t *m = (ezb_zcl_cmd_report_attr_message_t *)message;
     const uint16_t cluster = m->info.cluster_id;
 
+    /* The endpoint the report was addressed to says which knob it's for. */
+    knob_t *k = knob_for_endpoint(m->info.dst_ep);
+    if (k == NULL) {
+        return;
+    }
+
     for (const ezb_zcl_report_attr_variable_t *v = m->in.variables; v != NULL; v = v->next) {
         if (v->attr_value == NULL || v->attr_id != 0x0000) {
             continue;
         }
         if (cluster == EZB_ZCL_CLUSTER_ID_LEVEL) {
-            note_report_level(*(const uint8_t *)v->attr_value, now);
+            note_report_level(k, *(const uint8_t *)v->attr_value, now);
         } else if (cluster == EZB_ZCL_CLUSTER_ID_ON_OFF) {
-            note_report_onoff(*(const uint8_t *)v->attr_value != 0, now);
+            note_report_onoff(k, *(const uint8_t *)v->attr_value != 0, now);
         }
     }
 }
@@ -592,85 +690,94 @@ static void zcl_action_handler(ezb_zcl_core_action_callback_id_t id, void *messa
 /* Poller: decides when the Zigbee task has something to do            */
 /* ------------------------------------------------------------------ */
 
-static void update_backoff(uint32_t now)
+static void update_backoff(knob_t *k, uint32_t now)
 {
-    if (now - s_last_backoff_us < 3000000u) {
+    if (now - k->last_backoff_us < 3000000u) {
         return;
     }
-    s_last_backoff_us = now;
-    if (s_recent_tx >= 10) {
+    k->last_backoff_us = now;
+    if (k->recent_tx >= 10) {
         /* More than a quarter of recent sends failing means the radio is
          * congested: slow down rather than making it worse. */
-        if (s_recent_fail * 4 > s_recent_tx) {
-            if (s_extra_tick_ms < 200) {
-                s_extra_tick_ms = (uint16_t)(s_extra_tick_ms + 50);
-                ESP_LOGW(TAG, "radio busy (%u of %u failed) - slowing to %u ms",
-                         s_recent_fail, s_recent_tx, effective_tick_ms());
+        if (k->recent_fail * 4 > k->recent_tx) {
+            if (k->extra_tick_ms < 200) {
+                k->extra_tick_ms = (uint16_t)(k->extra_tick_ms + 50);
+                ESP_LOGW(TAG, "knob %d: radio busy (%u of %u failed) - slowing to %u ms",
+                         k->idx + 1, k->recent_fail, k->recent_tx, effective_tick_ms(k));
             }
-        } else if (s_extra_tick_ms > 0) {
-            s_extra_tick_ms = (uint16_t)(s_extra_tick_ms - 25);
+        } else if (k->extra_tick_ms > 0) {
+            k->extra_tick_ms = (uint16_t)(k->extra_tick_ms - 25);
         }
-        s_recent_tx = 0;
-        s_recent_fail = 0;
+        k->recent_tx = 0;
+        k->recent_fail = 0;
     }
 }
 
-static void poll_timer_cb(void *arg)
+/* Everything the 10 ms poller does, for one knob. */
+static void poll_one(knob_t *k, uint32_t now)
 {
-    uint8_t samples = (uint8_t)(g_knob_tune.debounce_ms / KNOB_POLL_MS);
+    uint8_t samples = (uint8_t)(k->tune.debounce_ms / KNOB_POLL_MS);
     if (samples < 1) {
         samples = 1;
     }
-    bool pressed = input_button_poll(samples);
+    bool pressed = input_button_poll(k->idx, samples);
 
     if (!s_stack_ready) {
         return;
     }
     if (pressed) {
-        esp_zigbee_task_queue_post(button_press_in_zb, NULL);
+        esp_zigbee_task_queue_post(button_press_in_zb, k);
     }
 
-    const uint32_t now = now_us();
-    update_backoff(now);
+    update_backoff(k, now);
 
-    if (s_rep_window_open && (now - s_rep_window_us) > 1000000u) {
-        esp_zigbee_task_queue_post(close_report_window_in_zb, NULL);
+    if (k->rep_window_open && (now - k->rep_window_us) > 1000000u) {
+        esp_zigbee_task_queue_post(close_report_window_in_zb, k);
     }
 
-    if (s_eval_posted) {
+    if (k->eval_posted) {
         return;
     }
 
-    const int32_t pending = (input_total() - s_consumed) + s_carry;
+    const int32_t pending = (input_total(k->idx) - k->consumed) + k->carry;
     bool due = false;
 
-    if (pending != 0 && (now - s_last_send_us) >= (uint32_t)effective_tick_ms() * 1000u) {
+    if (pending != 0 && (now - k->last_send_us) >= (uint32_t)effective_tick_ms(k) * 1000u) {
         /* First move after a pause: gather the whole click (4 counts) before
          * sending, or give up waiting after a few ms. Still feels instant,
          * but sends one clean command instead of a small one then a big one. */
-        if ((now - s_last_send_us) < 600000u) {
+        if ((now - k->last_send_us) < 600000u) {
             due = true;
         } else {
             int32_t mag = pending < 0 ? -pending : pending;
-            due = (mag >= 4) || ((now - input_last_edge_us()) >= 35000u);
+            due = (mag >= 4) || ((now - input_last_edge_us(k->idx)) >= 35000u);
         }
     }
-    if (s_settle_pending &&
-        (now - s_last_count_us) >= (uint32_t)g_knob_tune.settle_ms * 1000u &&
-        (now - s_last_send_us)  >= (uint32_t)g_knob_tune.settle_ms * 1000u) {
+    if (k->settle_pending &&
+        (now - k->last_count_us) >= (uint32_t)k->tune.settle_ms * 1000u &&
+        (now - k->last_send_us)  >= (uint32_t)k->tune.settle_ms * 1000u) {
         due = true;
     }
 
     if (due) {
-        s_eval_posted = true;
-        if (esp_zigbee_task_queue_post(engine_eval_in_zb, NULL) != ESP_OK) {
-            s_eval_posted = false;
+        k->eval_posted = true;
+        if (esp_zigbee_task_queue_post(engine_eval_in_zb, k) != ESP_OK) {
+            k->eval_posted = false;
         }
     }
 }
 
+static void poll_timer_cb(void *arg)
+{
+    const uint32_t now = now_us();
+    for (int i = 0; i < KNOB_COUNT; i++) {
+        poll_one(&s_knobs[i], now);
+    }
+}
+
 /* ------------------------------------------------------------------ */
-/* Data model: one HA Dimmer Switch endpoint                           */
+/* Data model: one command endpoint (+ optional report endpoint) per   */
+/* knob, all on one Zigbee device                                      */
 /* ------------------------------------------------------------------ */
 
 typedef ezb_zcl_cluster_desc_t (*cluster_create_fn)(const void *cfg, uint8_t role_mask);
@@ -683,18 +790,19 @@ static void ensure_cluster(ezb_af_ep_desc_t ep, uint16_t cluster_id, uint8_t rol
         return;
     }
     ezb_err_t err = ezb_af_endpoint_add_cluster_desc(ep, create(NULL, role));
-    ESP_LOGI(TAG, "added %s %s cluster: %s", name,
+    ESP_LOGD(TAG, "added %s %s cluster: %s", name,
              role == EZB_ZCL_CLUSTER_CLIENT ? "client" : "server",
              err == EZB_ERR_NONE ? "ok" : "FAILED");
+    if (err != EZB_ERR_NONE) {
+        ESP_LOGW(TAG, "could not add %s cluster", name);
+    }
 }
 
-static void create_data_model(void)
+static void add_command_endpoint(ezb_af_device_desc_t dev, uint8_t ep_id)
 {
-    ezb_af_device_desc_t dev = ezb_af_create_device_desc();
-
     ezb_zha_dimmer_switch_config_t cfg = EZB_ZHA_DIMMER_SWITCH_CONFIG();
     cfg.basic_cfg.power_source = EZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE;   /* USB/PoE */
-    ezb_af_ep_desc_t ep = ezb_zha_create_dimmer_switch(KNOB_EP, &cfg);
+    ezb_af_ep_desc_t ep = ezb_zha_create_dimmer_switch(ep_id, &cfg);
 
     /* CLIENT clusters are what get bound to the bulb, and the SDK won't send a
      * command from an endpoint that lacks the matching client cluster. */
@@ -715,28 +823,54 @@ static void create_data_model(void)
         ezb_zcl_basic_cluster_desc_add_attr(basic, EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
                                             KNOB_MODEL_IDENTIFIER);
     }
-
     ESP_ERROR_CHECK(esp_zigbee_err_to_esp(ezb_af_device_add_endpoint_desc(dev, ep)));
+}
 
 #if KNOB_USE_REPORTS
-    /* Endpoint 2 exists only to receive reports. Bind each bulb's On/Off and
-     * Level Control back to it in Z2M and the knob learns about changes made
-     * elsewhere. Bulbs that can't or won't report simply never appear here,
-     * and nothing else is affected. */
+/* A report endpoint exists only to receive reports. Bind each bulb's On/Off
+ * and Level Control back to it in Z2M and its knob learns about changes made
+ * elsewhere. Bulbs that can't or won't report simply never appear here, and
+ * nothing else is affected. */
+static void add_report_endpoint(ezb_af_device_desc_t dev, uint8_t ep_id)
+{
     ezb_zha_dimmer_switch_config_t rcfg = EZB_ZHA_DIMMER_SWITCH_CONFIG();
-    ezb_af_ep_desc_t rep_ep = ezb_zha_create_dimmer_switch(KNOB_EP_REPORTS, &rcfg);
+    ezb_af_ep_desc_t rep_ep = ezb_zha_create_dimmer_switch(ep_id, &rcfg);
     ensure_cluster(rep_ep, EZB_ZCL_CLUSTER_ID_ON_OFF, EZB_ZCL_CLUSTER_CLIENT,
                    ezb_zcl_on_off_create_cluster_desc, "On/Off");
     ensure_cluster(rep_ep, EZB_ZCL_CLUSTER_ID_LEVEL, EZB_ZCL_CLUSTER_CLIENT,
                    ezb_zcl_level_create_cluster_desc, "Level Control");
     ESP_ERROR_CHECK(esp_zigbee_err_to_esp(ezb_af_device_add_endpoint_desc(dev, rep_ep)));
+}
 #endif
+
+static void create_data_model(void)
+{
+    ezb_af_device_desc_t dev = ezb_af_create_device_desc();
+
+    for (int i = 0; i < KNOB_COUNT; i++) {
+        const knob_t *k = &s_knobs[i];
+        add_command_endpoint(dev, k->cmd_ep);
+#if KNOB_USE_REPORTS
+        if (k->report_ep != 0) {
+            add_report_endpoint(dev, k->report_ep);
+        }
+#endif
+    }
     ESP_ERROR_CHECK(esp_zigbee_err_to_esp(ezb_af_device_desc_register(dev)));
-    ESP_LOGI(TAG, "endpoint %d registered: dimmer switch (On/Off + Level client)", KNOB_EP);
+
+    for (int i = 0; i < KNOB_COUNT; i++) {
+        const knob_t *k = &s_knobs[i];
+        if (k->report_ep != 0 && KNOB_USE_REPORTS) {
+            ESP_LOGI(TAG, "knob %d: commands out on endpoint %u, reports in on endpoint %u",
+                     i + 1, k->cmd_ep, k->report_ep);
+        } else {
+            ESP_LOGI(TAG, "knob %d: commands out on endpoint %u", i + 1, k->cmd_ep);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
-/* Joining the network                                                 */
+/* Joining the network (shared by all knobs)                           */
 /* ------------------------------------------------------------------ */
 
 static void print_info_in_zb(void *ctx)
@@ -750,6 +884,15 @@ static void print_info_in_zb(void *ctx)
              ezb_bdb_dev_joined() ? "yes" : "no",
              (unsigned)ezb_get_short_address(), (unsigned)ezb_get_panid(),
              (unsigned)ezb_get_current_channel());
+    for (int i = 0; i < KNOB_COUNT; i++) {
+        const knob_t *k = &s_knobs[i];
+        if (k->report_ep != 0 && KNOB_USE_REPORTS) {
+            ESP_LOGI(TAG, "knob %d: bind endpoint %u to its bulbs (optional: bind the bulbs "
+                          "back to endpoint %u)", i + 1, k->cmd_ep, k->report_ep);
+        } else {
+            ESP_LOGI(TAG, "knob %d: bind endpoint %u to its bulbs", i + 1, k->cmd_ep);
+        }
+    }
 }
 
 static void commission_in_zb(void *ctx)
@@ -806,7 +949,7 @@ static bool app_signal_handler(const ezb_app_signal_t *app_signal)
     case EZB_BDB_SIGNAL_STEERING: {
         const ezb_bdb_signal_simple_params_t *p = params;
         if (p != NULL && p->status == EZB_BDB_STATUS_SUCCESS) {
-            ESP_LOGI(TAG, "JOINED as a router - now bind endpoint %d to a bulb in Z2M", KNOB_EP);
+            ESP_LOGI(TAG, "JOINED as a router - now bind each knob's endpoint to its bulbs in Z2M");
             print_info_in_zb(NULL);
         } else {
             ESP_LOGW(TAG, "no network found (status %d) - is permit-join on in Z2M? "
@@ -875,23 +1018,70 @@ static esp_err_t init_nvs_partition(const char *label)
     return err;
 }
 
+/* Endpoints must be 1-240 (the Zigbee rule) and all different. */
+static bool check_endpoints(void)
+{
+    bool ok = true;
+    for (int i = 0; i < KNOB_COUNT; i++) {
+        const uint8_t eps[2] = { KNOB_WIRING[i].cmd_ep, KNOB_WIRING[i].report_ep };
+        for (int e = 0; e < 2; e++) {
+            const uint8_t ep = eps[e];
+            if (e == 1 && ep == 0) {
+                continue;                       /* "no report endpoint" */
+            }
+            if (ep < 1 || ep > 240) {
+                ESP_LOGE(TAG, "knob %d: endpoint %u is outside 1-240", i + 1, ep);
+                ok = false;
+            }
+            for (int j = 0; j <= i; j++) {
+                const uint8_t other[2] = { KNOB_WIRING[j].cmd_ep, KNOB_WIRING[j].report_ep };
+                const int limit = (j == i) ? e : 2;
+                for (int f = 0; f < limit; f++) {
+                    if (other[f] != 0 && other[f] == ep) {
+                        ESP_LOGE(TAG, "knob %d: endpoint %u is already used by knob %d",
+                                 i + 1, ep, j + 1);
+                        ok = false;
+                    }
+                }
+            }
+        }
+    }
+    return ok;
+}
+
 esp_err_t zb_knob_start(void)
 {
+    if (!check_endpoints()) {
+        ESP_LOGE(TAG, "fix the endpoints in KNOB_WIRING (knob_config.h) and rebuild");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     ESP_ERROR_CHECK(init_nvs_partition(NULL));
     ESP_ERROR_CHECK(init_nvs_partition("zb_storage"));
-    load_settings();
+
+    for (int i = 0; i < KNOB_COUNT; i++) {
+        knob_t *k   = &s_knobs[i];
+        k->idx       = i;
+        k->cmd_ep    = KNOB_WIRING[i].cmd_ep;
+        k->report_ep = KNOB_WIRING[i].report_ep;
+        k->tune      = k_factory_tune;
+        k->level     = 128;
+        k->on        = true;
+        load_settings(k);
+        k->consumed  = input_total(i);
+
+        /* Each knob gets its own wake timer. `arg` is the knob itself, so
+         * the timer callback knows whose wake sequence to continue. */
+        const esp_timer_create_args_t wake_args = {
+            .callback = wake_timer_cb, .arg = k, .name = "knob_wake",
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&wake_args, &k->wake_timer));
+    }
 
     const esp_timer_create_args_t retry_args = {
         .callback = retry_timer_cb, .name = "zb_retry",
     };
     ESP_ERROR_CHECK(esp_timer_create(&retry_args, &s_retry_timer));
-
-    s_consumed = input_total();
-
-    const esp_timer_create_args_t wake_args = {
-        .callback = wake_timer_cb, .name = "knob_wake",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&wake_args, &s_wake_timer));
 
     const esp_timer_create_args_t poll_args = {
         .callback = poll_timer_cb, .name = "knob_poll",
@@ -909,6 +1099,16 @@ esp_err_t zb_knob_start(void)
 /* Console helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+/* The Zigbee task queue carries one pointer-sized value per job. For the
+ * console commands we pack the knob number and the command's arguments
+ * into that one number:  knob << 16 | flag << 8 | value. */
+#define PACK_CTX(knob, flag, value) \
+    ((void *)(uintptr_t)((((uintptr_t)(knob)) << 16) | (((uintptr_t)(flag) & 1u) << 8) | \
+                         ((uintptr_t)(value) & 0xFFu)))
+#define CTX_KNOB(ctx)  (&s_knobs[((uintptr_t)(ctx) >> 16) & 0xFFu])
+#define CTX_FLAG(ctx)  ((((uintptr_t)(ctx)) >> 8) & 1u)
+#define CTX_VALUE(ctx) ((uint8_t)((uintptr_t)(ctx) & 0xFFu))
+
 static esp_err_t post(esp_zigbee_callback_t cb, void *ctx)
 {
     if (!s_stack_ready) {
@@ -917,20 +1117,22 @@ static esp_err_t post(esp_zigbee_callback_t cb, void *ctx)
     return esp_zigbee_task_queue_post(cb, ctx);
 }
 
-static void toggle_in_zb(void *ctx)  { button_press_in_zb(NULL); }
+static bool valid_knob(int knob) { return knob >= 0 && knob < KNOB_COUNT; }
+
 static void onoff_in_zb(void *ctx)
 {
-    s_on = (ctx != NULL);
-    s_on_pending = false;
-    send_onoff(s_on);
+    knob_t *k = CTX_KNOB(ctx);
+    k->on = CTX_FLAG(ctx) != 0;
+    k->on_pending = false;
+    send_onoff(k, k->on);
 }
 static void step_in_zb(void *ctx)
 {
-    uintptr_t v = (uintptr_t)ctx;
-    uint8_t size = (uint8_t)(v & 0xFF);
-    bool up = ((v >> 8) & 1) != 0;
-    s_level = clamp_level((int32_t)s_level + (up ? size : -size));
-    (void)send_step(up, size);
+    knob_t *k    = CTX_KNOB(ctx);
+    bool    up   = CTX_FLAG(ctx) != 0;
+    uint8_t size = CTX_VALUE(ctx);
+    k->level = clamp_level((int32_t)k->level + (up ? size : -size));
+    (void)send_step(k, up, size);
 }
 static void steer_in_zb(void *ctx)   { commission_in_zb((void *)(uintptr_t)EZB_BDB_MODE_NETWORK_STEERING); }
 static void reset_in_zb(void *ctx)
@@ -939,33 +1141,48 @@ static void reset_in_zb(void *ctx)
     esp_zigbee_factory_reset();
 }
 
-esp_err_t zb_knob_toggle(void)          { return post(toggle_in_zb, NULL); }
-esp_err_t zb_knob_onoff(bool on)        { return post(onoff_in_zb, on ? (void *)(uintptr_t)1 : NULL); }
-esp_err_t zb_knob_step(bool up, uint8_t size)
+esp_err_t zb_knob_toggle(int knob)
 {
-    return post(step_in_zb, (void *)(uintptr_t)(((up ? 1u : 0u) << 8) | size));
+    if (!valid_knob(knob)) return ESP_ERR_INVALID_ARG;
+    return post(button_press_in_zb, &s_knobs[knob]);
+}
+esp_err_t zb_knob_onoff(int knob, bool on)
+{
+    if (!valid_knob(knob)) return ESP_ERR_INVALID_ARG;
+    return post(onoff_in_zb, PACK_CTX(knob, on, 0));
+}
+esp_err_t zb_knob_step(int knob, bool up, uint8_t size)
+{
+    if (!valid_knob(knob)) return ESP_ERR_INVALID_ARG;
+    return post(step_in_zb, PACK_CTX(knob, up, size));
 }
 esp_err_t zb_knob_print_info(void)      { return post(print_info_in_zb, NULL); }
 esp_err_t zb_knob_steer(void)           { return post(steer_in_zb, NULL); }
 esp_err_t zb_knob_factory_reset(void)   { return post(reset_in_zb, NULL); }
 
-void zb_knob_print_stats(void)
+void zb_knob_print_stats(int knob)
 {
-    printf("encoder : count %" PRId32 ", rejected jumps %" PRIu32 ", direction %s, button %s\n",
-           input_total(), input_rejected(), input_get_reverse() ? "reversed" : "normal",
-           input_button_is_pressed() ? "held" : "released");
-    printf("radio   : sent %" PRIu32 ", confirmed %" PRIu32 " (%" PRIu32 " failed), "
+    const knob_t *k = &s_knobs[knob];
+    printf("knob %d  (endpoint %u)\n", knob + 1, k->cmd_ep);
+    printf("  encoder : count %" PRId32 ", rejected jumps %" PRIu32 ", direction %s, button %s\n",
+           input_total(knob), input_rejected(knob), input_get_reverse(knob) ? "reversed" : "normal",
+           input_button_is_pressed(knob) ? "held" : "released");
+    printf("  radio   : sent %" PRIu32 ", confirmed %" PRIu32 " (%" PRIu32 " failed), "
            "not sent %" PRIu32 ", gap %u ms\n",
-           s_tx_count, s_cnf_count, s_cnf_fail, s_tx_err, effective_tick_ms());
-    printf("reports : %" PRIu32 " received from bulbs%s\n", s_reports_seen,
-           s_reports_seen ? "" : " (none - bind bulbs back to endpoint 2, or ignore)");
+           k->tx_count, k->cnf_count, k->cnf_fail, k->tx_err, effective_tick_ms(k));
+    if (k->report_ep != 0 && KNOB_USE_REPORTS) {
+        printf("  reports : %" PRIu32 " received from bulbs%s\n", k->reports_seen,
+               k->reports_seen ? "" : " (none - bind bulbs back to the report endpoint, or ignore)");
+    }
 }
 
-void zb_knob_print_state(void)
+void zb_knob_print_state(int knob)
 {
-    printf("intended: %s, level %u of %u (%u%%)%s\n", s_on ? "ON" : "OFF", s_level, LEVEL_MAX,
-           (unsigned)((s_level * 100u) / LEVEL_MAX), s_known ? ", confirmed by a bulb" : ", estimated");
-    if (s_on_pending) {
-        printf("          (waiting for a bulb to confirm it came on)\n");
+    const knob_t *k = &s_knobs[knob];
+    printf("knob %d: %s, level %u of %u (%u%%)%s\n", knob + 1, k->on ? "ON" : "OFF",
+           k->level, LEVEL_MAX, (unsigned)((k->level * 100u) / LEVEL_MAX),
+           k->known ? ", confirmed by a bulb" : ", estimated");
+    if (k->on_pending) {
+        printf("        (waiting for a bulb to confirm it came on)\n");
     }
 }

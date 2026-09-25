@@ -1,8 +1,12 @@
 /*
  * zb_knob.h - the Zigbee side: joins the network as a router, exposes one
- * Dimmer Switch endpoint that Zigbee2MQTT can bind to a bulb, and turns
- * encoder counts + button presses into BOUND commands (no destination address
- * in the firmware - the stack sends to whatever the binding table says).
+ * Dimmer Switch endpoint per knob that Zigbee2MQTT can bind to bulbs, and
+ * turns each knob's encoder counts + button presses into BOUND commands (no
+ * destination address in the firmware - the stack sends to whatever the
+ * binding table says for that knob's endpoint).
+ *
+ * Every function that takes `knob` counts from 0 (0 = first row of
+ * KNOB_WIRING). The console converts from the 1-based numbers you type.
  */
 #pragma once
 
@@ -10,7 +14,8 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-/* Live-tunable settings. Changed by the `tune` console command. */
+/* Live-tunable settings. Each knob has its own copy, changed by the `tune`
+ * console command and saved to flash per knob. */
 typedef struct {
     uint16_t    tick_ms;          /* minimum gap between dimming commands     */
     uint8_t     units;            /* brightness units per encoder count       */
@@ -24,19 +29,24 @@ typedef struct {
     bool        settle;           /* send the landing command at all          */
 } knob_tuning_t;
 
-extern knob_tuning_t g_knob_tune;
+/* That knob's live settings. The console edits them through this pointer,
+ * then calls zb_knob_save_settings(knob). */
+knob_tuning_t *zb_knob_tuning(int knob);
 
 esp_err_t zb_knob_start(void);
 
-/* Console helpers - all run inside the Zigbee task, so they're safe to call
- * from anywhere. They return an error if the stack isn't running yet. */
-esp_err_t zb_knob_toggle(void);
-esp_err_t zb_knob_onoff(bool on);
-esp_err_t zb_knob_step(bool up, uint8_t size);
+/* Console helpers for one knob - all run inside the Zigbee task, so they're
+ * safe to call from anywhere. They return an error if the stack isn't
+ * running yet. */
+esp_err_t zb_knob_toggle(int knob);
+esp_err_t zb_knob_onoff(int knob, bool on);
+esp_err_t zb_knob_step(int knob, bool up, uint8_t size);
+void      zb_knob_print_stats(int knob);
+void      zb_knob_print_state(int knob);
+void      zb_knob_save_settings(int knob);    /* keep current tuning across reboots */
+void      zb_knob_forget_settings(int knob);  /* back to the built-in defaults      */
+
+/* Whole-device helpers (one radio, one network, shared by all knobs). */
 esp_err_t zb_knob_print_info(void);
 esp_err_t zb_knob_steer(void);
 esp_err_t zb_knob_factory_reset(void);
-void      zb_knob_print_stats(void);
-void      zb_knob_print_state(void);
-void      zb_knob_save_settings(void);    /* keep current tuning across reboots */
-void      zb_knob_forget_settings(void);  /* back to the built-in defaults      */

@@ -1,5 +1,6 @@
 /*
- * main.c - Zigbee rotary dimmer knob (ESP32-C6).
+ * main.c - Zigbee rotary dimmer knobs (ESP32-C6). How many knobs, and on
+ * which pins, is set by the KNOB_WIRING table in knob_config.h.
  */
 #include "esp_log.h"
 #include "driver/gpio.h"
